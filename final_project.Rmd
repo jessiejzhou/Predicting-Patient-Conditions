@@ -1,0 +1,666 @@
+---
+title: "Predicting Patient Condition from Pharmaceutical Reviews"
+subtitle: "PSTAT 131 Final Project"
+author: "Jessie Zhou"
+date: "Winter 2023"
+output:
+  html_document:
+    theme: journal
+    toc: true
+    toc_float: 
+      smooth_scroll: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd(getwd())
+```
+
+```{r, fig.align='center'}
+knitr::include_graphics("medicine.jpeg")
+```
+
+
+## Introduction
+
+The goal of this project is to develop a machine learning model that is able to predict a patient's condition given their review of a certain drug. This is a classification problem, meaning that our outcome variable is categorical. We will be using a data set consisting of patient reviews of specific drugs and their related medical conditions, gained from crawling multiple online pharmaceutical review sites.
+
+### Motivation
+
+In the field of bio-statistics, an analysis like this is used to investigate the safety and efficacy of certain drugs, which pharmaceutical companies can then use to understand how patients react and determine the right dosage and administration. Additionally, it may also be helpful for clinical trials and studies that aim to evaluate the safety and efficacy of new drugs, as well as using the patterns to see how the medication will affect others with the same or similar conditions. By doing this, it may also help healthcare providers to diagnose a patient and choose the right medication based on their symptoms.
+
+### The Data
+
+This data was obtained from [Kaggle](https://www.kaggle.com/datasets/jessicali9530/kuc-hackathon-winter-2018?select=drugsComTrain_raw.csv), originally from the [UCI Machine Learning Repository](https://archive.ics.uci.edu/ml/datasets/Drug+Review+Dataset+%28Drugs.com%29). It was collected by crawling online pharmaceutical review sites, and consists of patient reviews of specific drugs along with their condition and satisfaction ratings. 
+
+## Loading Packages and Data
+
+First, we load the necessary packages and our data. I got pretty lucky with this; the data is already pre-split 75/25 into a training and testing dataset! However, let's still combine them to make cleaning a bit easier. 
+```{r, message = FALSE}
+library(tidyverse)
+library(tidytext)
+library(tidymodels)
+library(dplyr)
+library(ggplot2)
+library(kknn)
+library(glmnet)
+library(forcats)
+library(knitr)
+library(stringr)
+library(textdata)
+library(recipes)
+library(textrecipes)
+library(discrim)
+library(stopwords)
+library(naivebayes)
+library(caret)
+library(tune)
+library(yardstick)
+library(corrplot) 
+library(wordcloud)
+```
+
+```{r}
+set.seed(8)
+
+df1 <- read.csv("data/unprocessed/drugsComTest_raw.csv")
+df2 <- read.csv("data/unprocessed/drugsComTrain_raw.csv")
+
+df <- rbind(df1, df2)
+
+kable(head(df))
+```
+
+
+## Exploratory Data Analysis
+
+### Tidying the Raw Data
+
+Now that we've got our dataset, we want to tidy it up a bit. Since we're looking into predicting a patient's condition based on their review, we can remove all columns except condition and review.
+
+```{r}
+df <- subset(df, select = c(condition, review))
+```
+
+Taking a look at the dimensions, we note over 200,000 observations! My laptop won't be able to handle processing all it, so let's cut it roughly in half by taking 100,000 samples. 
+
+```{r}
+paste("Number of observations: ", nrow(df))
+
+subset_df <- df %>% 
+  sample_n(100000)
+```
+
+
+We also notice some inputting errors in the condition column—some cells have a message that read: "[n]</span> users found this comment helpful." There are also some missing values; since we have so many observations, there's no need to impute data and we can just remove cells with these errors.
+
+```{r}
+df_filter <- subset_df %>%
+  filter(!grepl("users found this comment helpful", condition))
+
+df_filter <- df_filter %>% filter(condition != "")
+
+```
+
+### Tidying the Outcome Variable
+
+Looking at our reviews, we see strong similarities between certain conditions (e.g. weight loss and obesity, anxiety and anxiety and stress). We can combine those into one condition; I'll be grouping together weight loss related conditions, anxiety related conditions, and depression related conditions. 
+
+```{r}
+df_filter$condition <- gsub("\\bWeight Loss\\b|\\bObesity\\b" , "Weight Loss Related", df_filter$condition)
+
+df_filter$condition <- gsub("\\bAnxiety and Stress\\b|\\bGeneralized Anxiety Disorder\\b|\\bAnxiety\\b", "Anxiety Related", df_filter$condition)
+
+df_filter$condition <- gsub("\\bDepression\\b|\\bMajor Depressive Disorde\\b" , "Depression Related", df_filter$condition)
+
+df_filter$condition <- gsub("Disorde" , "Disorder", df_filter$condition)
+
+df_filter$condition <- gsub("ibromyalgia" , "Fibromyalgia", df_filter$condition)
+
+# show just the condition column
+kable(df_filter$condition[1:10])
+```
+
+```{r, include = FALSE}
+temp_df <- subset_df %>%
+  filter(!grepl("users found this comment helpful", condition))
+
+temp_df <- temp_df %>% filter(condition != "")
+
+temp_df$condition <- gsub("\\bWeight Loss\\b|\\bObesity\\b" , "Weight Loss Related", temp_df$condition)
+
+temp_df$condition <- gsub("\\bAnxiety and Stress\\b|\\bGeneralized Anxiety Disorder\\b|\\bAnxiety\\b", "Anxiety Related", temp_df$condition)
+
+temp_df$condition <- gsub("\\bDepression\\b|\\bMajor Depressive Disorde\\b" , "Depression Related", temp_df$condition)
+
+temp_df$condition <- gsub("Disorde" , "Disorder", temp_df$condition)
+
+temp_df$condition <- gsub("ibromyalgia" , "Fibromyalgia", temp_df$condition)
+```
+
+
+### Exploration
+
+Now that everything is tidied up, we can begin to get a better look at our data. 
+
+#### Top Outcome Categories
+
+Taking a closer look at our outcome, we notice that there are 762 different conditions (even after grouping a few together)! 
+
+```{r}
+num_factors <- length(unique(temp_df$condition))
+paste("Number of conditions: ", num_factors)
+```
+
+Let's make a plot of our top 20 conditions; realistically, I'll only be predicting the top few  to make for a less complex and more interpretable model. In addition, some conditions have so little reviews that the prediction may not have sufficient information. 
+
+```{r}
+top_20 <- temp_df %>%
+  count(condition) %>%
+  slice_max(n=20, order_by = n) %>%
+  arrange(desc(n))
+
+p1 <- ggplot(data = top_20, aes(x = n, y = reorder(condition,n))) + geom_bar(fill = "indianred2", stat = "identity") +
+  theme(axis.text.y = element_text(size = 6)) + 
+  labs(title = "Top 20 Conditions", x = "Count", y = "Condition")
+ 
+p1
+```
+
+After seeing the plot, we notice how the top ten conditions (Birth Control-Type 2 Diabetes) are a majority of the data. To reduce model complexity as stated above, I'll focus on predicting just the top ten and dropping the rest. 
+
+#### Most Frequent Words
+
+Since this model works with Natural Language Processing (NLP), one thing we can do is look at the most frequent words in the reviews to get a better look at our predictors. We'll first get all the unique words, removing any stop words (which are common prepositions, nouns, and other non-useful words (think of "the," "and," "I,"...)) and filtering out any numbers. Then, we'll create a dataset of unigrams. A unigram is a type of n-gram, which is a sequence of "n" words, and in our case n is one.
+
+```{r}
+unigrams <- temp_df %>%
+  unnest_tokens(word, review) %>%
+  count(word, sort = TRUE) %>%
+  anti_join(stop_words, by = "word")
+
+unigrams <- unigrams %>%
+  filter(!str_detect(word, "^\\d+$"))
+
+kable(head(unigrams))
+```
+
+Now, we can visualize our top 25 most common words: 
+```{r}
+wordcloud(unigrams$word, freq = unigrams$n, max.words = 25, random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+```
+
+```{r}
+ggplot(unigrams[1:25,], aes(x = n, y = reorder(word,n))) +
+  theme(axis.text.y = element_text(size = 6)) +
+  geom_bar(fill = "indianred2",stat= "identity") + 
+  labs(title = "Top 25 Words", x = "Count", y = "Word")
+```
+
+
+
+This allows us to get a better idea of what exactly our model will be using to predict condition. In NLP, we want to use these unique words as *tokens*, which are sequences of  characters that represent a meaningful unit of text. When we process our data later on, we perform *tokenization*, the process in which the review data will be split into tokens and used as input for our models. In our case, R will split the reviews into individual words, and give each word a numerical representation that can be used for prediction.
+
+#### Word Frequency
+
+There are multiple ways in which tokens can be represented numerically:
+
+  - Binary encoding, where a binary variable is created for each token with 1 representing         it's presence in the document and 0 its absence.
+
+  - Count, where the number of occurences of a token in a document is recorded.
+
+  - TF-IDF, short for Term Frequency-Inverse Document Frequency, which measures the                importance of a token in a document based on how frequently it appears in the document         and how common or rare it is. It is calculated by multiplying term frequency (how often a       word occurs in a document) by inverse document frequency (a measure of the importance of       a word in the whole collection of documents).
+
+  - Word Embedding, which represents text data as a numerical vector that can capture              relationships between words. 
+    
+  - And many more.
+
+**For our model**, we will focus on TF-IDF, which tells us how relevant words are in our reviews. Let's visualize the scores from the previous unigrams dataset.
+
+![](tfidf.png)
+
+```{r}
+word_tfidf <- temp_df %>%
+  unnest_tokens(word, review) %>%
+  count(condition, word) %>%
+  anti_join(stop_words, by = "word") %>%
+  bind_tf_idf(word, condition, n) %>%
+  arrange(desc(tf_idf)) %>%
+  filter(!str_detect(word, "^\\d+$")) 
+
+top_unigrams <- word_tfidf %>%
+  arrange(desc(tf_idf)) %>%
+  slice_head(n = 25)
+
+ggplot(top_unigrams, aes(x = tf_idf, y = reorder(word, tf_idf))) +
+  geom_col(fill = "indianred2") +
+  labs(title = "Top 25 Unigrams by TF-IDF Score", x = "TF-IDF Score", y = "Unigram")
+
+```
+
+From this plot, we can see the top 25 words that are best for distinguishing between conditions, and we have a better idea of how our model will work. We can also see the top 25 words for distinguishing between our top 10 conditions.
+```{r, include=FALSE}
+temp_df$condition <- gsub(" " , "", temp_df$condition)
+temp_df$condition <- gsub("," , "", temp_df$condition)
+temp_df$condition <- factor(temp_df$condition, levels = c("BirthControl",
+                                                              "DepressionRelated",
+                                                              "AnxietyRelated",
+                                                              "WeightLossRelated",
+                                                              "Pain",
+                                                              "Acne",
+                                                              "BipolarDisorder",
+                                                              "Insomnia",
+                                                              "ADHD",
+                                                              "DiabetesType2"
+                                                              ))
+
+temp_df <- na.omit(temp_df)
+
+tfidf_filter <- temp_df %>%
+  unnest_tokens(word, review) %>%
+  count(condition, word) %>%
+  anti_join(stop_words, by = "word") %>%
+  bind_tf_idf(word, condition, n) %>%
+  arrange(desc(tf_idf)) %>%
+  filter(!str_detect(word, "^\\d+$")) %>%
+  arrange(desc(tf_idf)) %>%
+  slice_head(n = 25)
+```
+
+```{r}
+wordcloud(tfidf_filter$word, freq = tfidf_filter$tf_idf, max.words = 25, random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+```
+
+```{r}
+
+ggplot(tfidf_filter, aes(x = tf_idf, y = reorder(word, tf_idf))) +
+  geom_col(fill = "indianred2") +
+  labs(title = "Top 25 Unigrams for Top 10 Conditions", x = "TF-IDF Score", y = "Unigram")
+
+```
+
+
+Now, we can clearly see what our model will be using to predict the top 10 conditions. Let's get to model building!
+
+
+## Model Setup
+
+### Factoring and Data Split
+
+We've finally prepped our data to be fit! Before we do that, there's just a couple more preparatory steps to be taken. First, because this is a classification problem, we need to factor our outcome variable so that R can treat it as a categorical variable. I decided to just focus on the top 10 conditions, as they are a majority proportion of the data (and it'll make for a simpler model). I also decided not to include `Emergency Contraception` as it's similar to birth control, and opted to include Type 2 Diabetes instead. Then, the other conditions not in the top 10 are dropped. 
+
+```{r}
+df_filter$condition <- gsub(" " , "", df_filter$condition)
+df_filter$condition <- gsub("," , "", df_filter$condition)
+df_filter$condition <- factor(df_filter$condition, levels = c("BirthControl",
+                                                              "DepressionRelated",
+                                                              "AnxietyRelated",
+                                                              "WeightLossRelated",
+                                                              "Pain",
+                                                              "Acne",
+                                                              "BipolarDisorder",
+                                                              "Insomnia",
+                                                              "ADHD",
+                                                              "DiabetesType2"
+                                                              ))
+
+df_filter <- na.omit(df_filter)
+
+kable(df_filter$condition[1:10])
+```
+
+Now that we've encoded our outcome as factors, let's split the data. Creating a train/test split is crucial in model fitting as it gives the model enough data to learn, while still allowing us to evaluate the performance of the model on unseen data with the testing set. It also prevents model over-fitting; if all of the data was used to train, then the model learns the patterns of that data too well and performs poorly on new data. I decided to go with a 75/25 split stratified on `condition`; this ensures having a good proportion of data for training and testing, where both sets have a proportionate distribution of `condition` that reflect the original dataset.
+```{r}
+split <- initial_split(df_filter, prop = 0.75, strata = condition)
+
+train <- training(split)
+test <- testing(split)
+
+```
+
+
+### K-fold CV
+
+To aid with assessing model performance without touching our testing data, we'll do k-fold cross validation stratified on our outcome variable `condition`. This means our training data is divided into 5 equal subsets or "folds", and 5 models are fit by using one fold as the testing or "validation" set and the other four as a training set, repeating for each fold. Cross validation is a useful technique that allows us to use all of the data for training and testing, reducing variance in our model performance estimates. 
+
+I decieded to set k = 5 for computationally efficiency due to how large my data set is. 
+
+```{r}
+folds <- vfold_cv(train, v = 5, strata = condition)
+```
+
+
+### Creating a Recipe
+
+```{r, fig.align='center'}
+knitr::include_graphics("ww.gif")
+```
+
+Now, we can begin creating a recipe. Since we will use the same predictor, outcome, and conditions for all models, we can create a general recipe that will prepare our data in the same way for every model. 
+
+First, we'll tokenize the words in `review`. We can achieve this using the `step_tokenize()` function. 
+
+After tokenizing, we also want to remove unrelated stop words as we did previously when creating a unigrams dataset. We can use `step_stopwords()` for this. 
+
+Next, we want to limit the amount of tokens used to predict our outcome using `step_tokenfilter()`. As seen in the EDA section above, there are too many tokens to count. To maximize model efficiency and reduce over-fitting, I set the max amount of tokens to 100. (*See note for details on why I chose 100.*)
+
+Finally, we call `step_tfidf()` on reviews to calcuate the TF-IDF score on the filtered and tokenized words. This is a vital step that converts the tokens into numerical data that can be used as input to our model.
+
+*Note: while we would usually use the same model conditions for all models, I decided to tune `max_tokens`to set a baseline. Therefore, I created 2 recipes, one for tuning `max_tokens` and the rest with `max_tokens` fixed. I decided to tune it in my Naive Bayes model, as it has no other parameters to tune. This is just to get a grasp at roughly what range of tokens works well; while different models will probably give different outcomes, it should roughly be the same. After tuning, I found a lower number of tokens to fit better, so I set it to 100 for the general recipe.*
+
+```{r}
+nb_recipe <- recipe(condition ~ review, data = train) %>%
+  step_tokenize(review) %>%
+  step_stopwords(review) %>%
+  step_tokenfilter(review, max_tokens = tune()) %>%
+  step_tfidf(review)
+
+reviews_recipe <- recipe(condition ~ review, data = train) %>%
+  step_tokenize(review) %>%
+  step_stopwords(review) %>%
+  step_tokenfilter(review, max_tokens = 100) %>%
+  step_tfidf(review)
+```
+
+
+
+## Model Building
+
+### Evaluation Metric
+
+To assess my model performance, I'll be using the area under the ROC curve as my metric. The ROC (receiver operating characteristic) curve is a graph that shows the tradeoff between the true positive rate and false positive rate of a model. In R, the x-axis is set to 1-specificity and the y-axis is set to sensitivity. Sensitivity (true positive) is the proportion of positive instances that are correctly classified as positive by the classifier. Specificity is the true negative rate, which is the proportion of negative instances that are correctly classified as negative by the classifier. Therefore, 1-specificity gives us the false positive rate. A perfect classifier would be at the top left corner of our ROC curve, with a true positive of 1 and false positive of 0.
+
+The AUC is the area under the ROC curve, which summarizes the overall performance of the classifier across all possible threshold values. It ranges from 0 to 1; however, we mainly assess AUC values between 0.5 and 1 as 0.5 denotes a completely random classifier and 1 denotes a perfect classifier. 
+
+```{r, fig.align='center'}
+knitr::include_graphics("roc.png")
+```
+
+### Steps
+
+Onto the real model building! Our model construction will consist of 6 steps: 
+
+1. Setting up the model by specifying the type, tuning parameters, engine, and mode (all set to classification). 
+```{r}
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+
+lda_spec <- discrim_linear() %>%
+  set_mode("classification") %>%
+  set_engine("MASS")
+
+ridge_spec <- multinom_reg(penalty = tune(), mixture = 0) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lasso_spec <- multinom_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+en_spec <- multinom_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+tree_spec <- decision_tree(cost_complexity = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+```
+
+2. Creating a workflow for each model, adding our general recipe and the corresponding model.
+
+```{r}
+nb_wf <- workflow() %>%
+  add_recipe(nb_recipe) %>%
+  add_model(nb_spec)
+
+lda_wf <- workflow() %>%
+  add_recipe(reviews_recipe) %>%
+  add_model(lda_spec)
+
+ridge_wf <- workflow() %>%
+  add_recipe(reviews_recipe) %>%
+  add_model(ridge_spec)
+
+lasso_wf <- workflow() %>%
+  add_recipe(reviews_recipe) %>%
+  add_model(lasso_spec)
+
+en_wf <- workflow() %>%
+  add_recipe(reviews_recipe) %>%
+  add_model(en_spec)
+
+knn_wf <- workflow() %>%
+  add_recipe(reviews_recipe) %>%
+  add_model(knn_spec)
+
+tree_wf <- workflow() %>%
+  add_model(tree_spec) %>%
+  add_recipe(reviews_recipe)
+```
+
+
+3. Creating a tuning grid (if necessary) for each model, using the default values for most models.
+```{r}
+nb_grid <- grid_regular(max_tokens(range = c(50,200)), levels = 10)
+
+ridge_grid <- grid_regular(penalty(), levels = 10)
+
+lasso_grid <- grid_regular(penalty(), levels = 10)
+
+en_grid <- grid_regular(penalty(), mixture(), levels = 10)
+
+knn_grid <- grid_regular(neighbors(range = c(1,10)), levels = 10)
+
+tree_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+```
+
+
+4. Tuning the model, specifying workflow, cross-validation folds, tuning grid, and saving the predictions.
+
+```{r, eval=FALSE}
+nb_tune <- tune_grid( object = nb_wf,
+                      resamples = folds,
+                      grid = nb_grid,
+                      control = control_resamples(save_pred = TRUE))
+
+lda_tune <- tune_grid(object = lda_wf,
+                      resamples = folds,
+                      control = control_resamples(save_pred = TRUE))
+
+ridge_tune <- tune_grid(object = ridge_wf,
+                                 resamples = folds,
+                                 grid = ridge_grid,
+                                control = control_resamples(save_pred = TRUE))
+
+lasso_tune <- tune_grid(object = lasso_wf,
+                                 resamples = folds,
+                                 grid = lasso_grid,
+                                control = control_resamples(save_pred = TRUE))
+
+en_tune <- tune_grid(object = en_wf,
+                             resamples = folds,
+                             grid = en_grid,
+                             control = control_resamples(save_pred = TRUE))
+
+knn_tune <- tune_grid(object = knn_wf,
+                      resamples = folds,
+                      grid = knn_grid,
+                      control = control_resamples(save_pred = TRUE))
+
+tree_tune <- tune_grid(object = tree_wf,
+                       resamples = folds,
+                       grid = tree_grid,
+                       control = control_resamples(save_pred = TRUE))
+```
+
+5. Saving the models as an RDA file to avoid re-running, then loading them back in.
+
+```{r, eval=FALSE}
+save(nb_tune, file = "nb.rda")
+save(lda_tune, file = "lda.rda")
+save(ridge_tune, file = "ridge.rda")
+save(lasso_tune, file = "lasso.rda")
+save(en_tune, file = "en.rda")
+save(knn_tune, file = "knn.rda")
+save(tree_tune, file = "tree.rda")
+```
+
+```{r}
+load(file = "models/nb.rda")
+load(file = "models/lda.rda")
+load(file = "models/ridge.rda")
+load(file = "models/lasso.rda")
+load(file = "models/en.rda")
+load(file = "models/knn.rda")
+load(file = "models/tree.rda")
+```
+
+
+6. Collecting metrics for the tuned models, saving the fit with the best ROC_AUC score.
+```{r}
+nb_metrics <- collect_metrics(nb_tune)
+nb_predictions <- collect_predictions(nb_tune)
+best_nb <- select_by_one_std_err(nb_tune, metric = "roc_auc", max_tokens)
+
+lda_metrics <- collect_metrics(lda_tune)
+lda_predictions <- collect_predictions(lda_tune)
+best_lda <- lda_metrics[2,]$mean
+  
+ridge_metrics <- collect_metrics(ridge_tune)
+ridge_predictions <- collect_predictions(ridge_tune)
+best_ridge <- select_by_one_std_err(ridge_tune, metric = "roc_auc", penalty)
+
+lasso_metrics <- collect_metrics(lasso_tune)
+lasso_predictions <- collect_predictions(lasso_tune)
+best_lasso <- select_by_one_std_err(lasso_tune, metric = "roc_auc", penalty)
+
+en_metrics <- collect_metrics(en_tune)
+en_predictions <- collect_predictions(en_tune)
+best_en <- select_by_one_std_err(en_tune,
+                                     metric = "roc_auc",
+                                     penalty, mixture)
+
+knn_metrics <- collect_metrics(knn_tune)
+knn_predictions <- collect_predictions(knn_tune)
+best_knn <- select_by_one_std_err(knn_tune,
+                                     metric = "roc_auc",
+                                     neighbors)
+
+tree_metrics <- collect_metrics(tree_tune)
+tree_predictions <- collect_predictions(tree_tune)
+best_tree <- select_by_one_std_err(tree_tune,
+                                     metric = "roc_auc",
+                                     cost_complexity)
+```
+
+## Model Results
+
+After collecting the best performing fit from each model, we can look at the results side-by-side. We see that all three of our regularized regression models performed best! We'll be focusing on our top 2 models: lasso and elastic net regression.
+
+```{r}
+results_tibble <- tibble(name = c("Naive Bayes", "LDA", "Ridge", "Lasso", "Elastic Net", "KNN", "Decision Tree"), auc = c(best_nb$mean, best_lda, best_ridge$mean, best_lasso$mean, best_en$mean, best_knn$mean, best_tree$mean))
+
+kable(results_tibble)
+
+ggplot(results_tibble, aes(x= reorder(name, auc), y = auc)) + geom_bar(fill = "indianred2", stat = "identity") +
+  labs(title = "AUC Values Across Models", x = "Model", y =" ROC AUC value") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Best Models
+
+As stated above, we'll focus on assessing our top 2 best performing models, lasso and elastic net regression. These are both regularized regression models, which are variants of a standard linear regression method. In ordinary least squares (OLS) regression, the model seeks to minimize the sum of squared residuals (difference between observed and predicted value of a variable). OLS functions look like a typical linear function in the form  $y = \beta_0 + \beta_1\cdot x + \epsilon$, where $\beta_0$ is the intercept, $\beta_1$ is the slope, and $\epsilon$ is an error term.
+
+Lasso regression adds a penalty term to the OLS function in order to constrain the model coefficients ($\beta_0$ and $\beta_1$ in the above example) and prevent overfitting. Lasso regression adds a L1 penalty term to the OLS function, which forces some of the model coefficients to be exactly zero and reduces the number of predictors that are included in the model. It can help to prevent overfitting, improve the interpretability of the model, and perform feature selection by shrinking the coefficients of the less important features towards zero.
+
+Elastic net regression is a combination of ridge regression (which adds a L2 penalty term to the OLS function, forcing the model coefficients to be small and reducing their variance) and lasso regression. Elastic net regression adds both L1 and L2 penalty terms to the function, which allows it to perform feature selection and shrinkage at the same time. This can be useful when dealing with high-dimensional data sets with many correlated features.
+
+```{r, fig.align='center'}
+knitr::include_graphics("regularization.png")
+```
+
+
+### Autoplots
+
+Let's use the `autoplot()` function to visualize the effects of the tuning parameters for each model. For lasso, we're tuning `penalty`, which is the amount of regularization. For elastic net, we tune both `penalty` and `mixture`, where `mixture` controls L1 and L2 penalties. A `mixture` value of 0 indicates ridge regression, and a value of 1 indicates lasso regression.
+```{r}
+autoplot(lasso_tune) 
+autoplot(en_tune)
+```
+
+From our plots, we can see the optimal values of the tuning parameters. For lasso regression, smaller values of `penalty` yield a higher ROC AUC score. For elastic net, smaller values of both `penalty` and `mixture` yield higher ROC AUC scores. Because lasso outperformed ridge regression and a `mixture` of 0 indicates ridge regression, it's interesting to see how values of `mixture` closer to 0 perform better. We can show the specific values of the parameters below.
+
+```{r}
+best_lasso
+best_en
+```
+We see values of ROC AUC close to 0.9, which is considered to be quite good!
+
+
+### Fitting to Testing Set
+
+Let's now fit our best models to the testing set, and plot the ROC curves.
+```{r}
+lasso_final <- finalize_workflow(lasso_wf, best_lasso) %>%
+  fit(data = train)
+
+final_lasso <- augment(lasso_final, new_data = test) %>%
+  select(condition, starts_with(".pred"))
+
+en_final <- finalize_workflow(en_wf, best_en) %>%
+  fit(data = train)
+
+final_en <- augment(en_final, new_data = test) %>%
+  select(condition, starts_with(".pred"))
+
+```
+
+
+```{r}
+augment(lasso_final, new_data = test) %>%
+  roc_curve(truth = condition, estimate = .pred_BirthControl:.pred_DiabetesType2) %>% 
+  autoplot()
+
+augment(en_final, new_data = test) %>%
+  roc_curve(truth = condition, estimate = .pred_BirthControl:.pred_DiabetesType2) %>% 
+  autoplot()
+
+```
+
+Our plots for the 2 are very similar, with very slight differences in `DiabetesType2` and `ADHD`. All plots are generally very good, with slightly worse performance in the `DiabetesType2` , `ADHD`, `DepressionRelated`, `BipolarDisorder`, and `AnxietyRelated` conditions. This might be because of correlation between the outcome factors and between predictors; reviews for depression, anxiety, ADHD, and bipolar disorder might have common words they are all mental disorders. For type 2 diabetes, there might not have been as much data as the rest due to it being the least common of the 10.
+
+Let's try to confirm similarities between the reviews regarding mental conditions. To do this, we can create a confusion matrix to see if any were falsely classified as another.
+
+```{r}
+conf_mat(final_lasso, truth = condition, 
+         .pred_class) %>% 
+  autoplot(type = "heatmap", fill = "indianred2") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+conf_mat(final_en, truth = condition, 
+         .pred_class) %>% 
+  autoplot(type = "heatmap", fill = "indianred2") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We confirmed our theory! Our heatmaps show that for both models, all four mental conditions are  misclassified the most as the other 3. This makes sense, as our predictors are words in the review, and it would make sense that there are shared words among the four.
+
+```{r, fig.align='center'}
+knitr::include_graphics("ww2.gif")
+```
+
+## Conclusion
+
+Throughout extensive research, model fitting, testing, and analysis, we have found that regularized regression models fit best to our NLP model. Out of the three, Lasso Regression performed the best, although it only marginally outperformed the other two. This wasn't too surprising; regularized regression is good for preventing model overfit and dealing with high dimensional data and because our model used so many tokens, regularization methods would help with reducing some of these features. In fact, lasso most likely performed the best due to its ability to shrink features to zero, simplifying the model and improving interpretability.
+
+Our worst performing model was Naive Bayes, and I was the most surprised by this as it is often used for NLP tasks. This could be due to strong correlation between features (Naive Bayes assumes conditional independence), model overfit/underfit, and many other reasons. 
+
+While the best performing models performed very well, there could be more steps taken to produce an even better fit. In particular, more complex models such as random forest, boosted trees, and support vector machines (SVM) could be considered. However, due to the sheer size of my dataset, I unfortunately could not run any of these on my laptop (I definitely tried). The tree methods would definitely improve upon the single decision tree I implemented by creating a more robust model, reducing variance and overfit, while SVM could have been helpful with our high-dimensional data. However, these all require more computation that my laptop could not handle. In addition to more complex models, I could have tuned the number of tokens for each separate model, instead of doing it for just one and setting it as the baseline for the others. Then, I would be able to optimize the number of predictors that would work best for each. However, just tuning it once took a lot of computational power.
+
+Overall, this project helped me gain a better understanding of machine learning concepts, and I'm surprised by how well some models performed. As I unlocked more concepts, I found myself more and more interested in which models would perform best, how to tune my parameters, the best way to clean my data, and other ways in which I could apply my knowledge. I definitely found a lot of appreciation for the subject, and I'm glad to have had the opportunity to build my skills and produce a project that I'm proud of. 
